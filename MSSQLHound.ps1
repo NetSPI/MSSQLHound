@@ -1,4 +1,4 @@
- <#
+<#
 .SYNOPSIS
 MSSQLHound: PowerShell collector for adding MSSQL attack paths to BloodHound with OpenGraph
 
@@ -226,8 +226,8 @@ param(
     [SecureString]$SecureString,
     [string]$Password,#="password",
 
-    # Specify domain in DOMAIN.COM format - useful when using RunAs and $env:USERDNSDOMAIN is incorrect
-    [string]$script:Domain = $env:USERDNSDOMAIN,
+    # Specify domain in DOMAIN.COM format
+    [string]$Domain = $env:USERDNSDOMAIN,
     
     [switch]$IncludeNontraversableEdges,
 
@@ -266,6 +266,7 @@ if ($Help) {
 # Script version information
 $script:ScriptVersion = "1.0"
 $script:ScriptName = "MSSQLHound"
+$script:Domain = $Domain
 
 # Handle version request
 if ($Version) {
@@ -438,68 +439,13 @@ elseif ($OutputFormat -eq 'BloodHound-customnode') {
 }
 
 if (-not $script:Domain) {
-    # When using runas /netonly, we need to detect the domain differently
-    # Try multiple approaches to find the domain
-    
-    # First check if we're in a domain context by testing LDAP connectivity
-    $possibleDomains = @()
-    
-    # Check environment variables that might be set
-    if ($env:USERDNSDOMAIN) { $possibleDomains += $env:USERDNSDOMAIN }
-    if ($env:LOGONSERVER -and $env:LOGONSERVER -ne '\\' + $env:COMPUTERNAME) {
-        # Extract domain from logon server
-        try {
-            $serverName = $env:LOGONSERVER -replace '\\\\', ''
-            $dns = [System.Net.Dns]::GetHostEntry($serverName)
-            if ($dns.HostName -match '\.(.+)$') {
-                $possibleDomains += $matches[1]
-            }
-        } catch {}
-    }
-    
-    # Try to detect from any accessible domain controller
     try {
-        $rootDSE = [ADSI]"LDAP://RootDSE"
-        if ($rootDSE.defaultNamingContext) {
-            $domainDN = $rootDSE.defaultNamingContext
-            $script:Domain = $domainDN -replace '^DC=' -replace ',DC=', '.'
-            Write-Host "Detected domain from LDAP RootDSE: $script:Domain"
-        }
+        Write-Warning "No domain provided and could not find `$env:USERDNSDOMAIN, trying computer's domain"
+        $script:Domain = (Get-CimInstance Win32_ComputerSystem).Domain
+        Write-Host "Using computer's domain: $script:Domain"
     } catch {
-        Write-Verbose "Could not connect to LDAP RootDSE: $_"
-        
-        # Try common domain suffixes if we can detect any LDAP server
-        foreach ($testDomain in $possibleDomains) {
-            try {
-                $testPath = "LDAP://" + ("DC=" + ($testDomain -replace "\.", ",DC="))
-                $testBind = [ADSI]$testPath
-                if ($testBind.Path) {
-                    $script:Domain = $testDomain
-                    Write-Host "Found accessible domain: $script:Domain"
-                    break
-                }
-            } catch {
-                Write-Verbose "Domain $testDomain not accessible: $_"
-            }
-        }
-    }
-    
-    # Last resort - check computer domain
-    if (-not $script:Domain) {
-        try {
-            $computerDomain = (Get-CimInstance Win32_ComputerSystem).Domain
-            if ($computerDomain -and $computerDomain -ne 'WORKGROUP') {
-                Write-Warning "No accessible domain found via LDAP. Computer reports domain: $computerDomain"
-                Write-Warning "This may not work correctly. Consider using -Domain parameter."
-                $script:Domain = $computerDomain
-            }
-        } catch {}
-    }
-    
-    if (-not $script:Domain) {
-        Write-Error "Unable to detect domain. When using runas /netonly from a non-domain machine, please specify -Domain parameter."
-        Write-Host "Example: .\sql.ps1 -Domain training.local" -ForegroundColor Yellow
-        return
+        Write-Warning "Error getting computer's domain, using `$env:USERDOMAIN: $_"
+        $script:Domain = $env:USERDOMAIN
     }
 }
 
@@ -4371,25 +4317,24 @@ function Resolve-PrincipalInDomain {
     
     $adPowershellSucceeded = $false
     
+    # Try Active Directory PowerShell module first
     if (Get-Command -Name Get-ADComputer -ErrorAction SilentlyContinue) {
         Write-Verbose "Trying AD PowerShell module in domain: $Domain"
         
         try {
             $adObject = $null
             
+            # Set server parameter if domain is specified and different from current
             $adParams = @{ Identity = $Name }
             if ($Domain -and $Domain -ne $env:USERDOMAIN -and $Domain -ne $env:USERDNSDOMAIN) {
                 $adParams.Server = $Domain
             }
             
+            # Try Computer first
             try {
                 $adObject = Get-ADComputer @adParams -ErrorAction Stop
             } catch {
-                try {
-                    $adParams.Identity = "${Name}$"
-                    $adObject = Get-ADComputer @adParams -ErrorAction Stop
-                } catch {
-                }
+                # Try Computer by SID
                 try {
                     $adParams.Remove('Identity')
                     $adParams.LDAPFilter = "(objectSid=$Name)"
@@ -4463,16 +4408,20 @@ function Resolve-PrincipalInDomain {
         }
     }
     
+    # Try .NET DirectoryServices AccountManagement
     if ($script:UseNetFallback -or -not (Get-Command -Name Get-ADComputer -ErrorAction SilentlyContinue) -or -not $adPowershellSucceeded) {
         Write-Verbose "Attempting .NET DirectoryServices AccountManagement for '$Name' in domain '$Domain'"
         
         try {
+            # Load assemblies - these must succeed for .NET approach to work
             Add-Type -AssemblyName System.DirectoryServices.AccountManagement -ErrorAction Stop
             Add-Type -AssemblyName System.DirectoryServices -ErrorAction Stop
             
+            # Try AccountManagement approach
             $context = New-Object System.DirectoryServices.AccountManagement.PrincipalContext([System.DirectoryServices.AccountManagement.ContextType]::Domain, $Domain)
             $principal = $null
             
+            # Try as Computer
             try {
                 $principal = [System.DirectoryServices.AccountManagement.ComputerPrincipal]::FindByIdentity($context, $Name)
                 if ($principal) {
@@ -4482,6 +4431,7 @@ function Resolve-PrincipalInDomain {
                 Write-Verbose "Computer lookup failed: $_"
             }
             
+            # Try as User if computer lookup failed
             if (-not $principal) {
                 try {
                     $principal = [System.DirectoryServices.AccountManagement.UserPrincipal]::FindByIdentity($context, $Name)
@@ -4493,6 +4443,7 @@ function Resolve-PrincipalInDomain {
                 }
             }
             
+            # Try as Group if user lookup failed
             if (-not $principal) {
                 try {
                     $principal = [System.DirectoryServices.AccountManagement.GroupPrincipal]::FindByIdentity($context, $Name)
@@ -4532,9 +4483,11 @@ function Resolve-PrincipalInDomain {
             Write-Verbose "Failed .NET DirectoryServices AccountManagement for '$Name' in domain '$Domain': $_"
         }
         
+        # Try ADSISearcher approach
         try {
             Write-Verbose "Attempting ADSISearcher for '$Name' in domain '$Domain'"
             
+            # Build LDAP path
             $domainDN = if ($Domain) {
                 "DC=" + ($Domain -replace "\.", ",DC=")
             } else {
@@ -4548,9 +4501,9 @@ function Resolve-PrincipalInDomain {
                 [ADSISearcher]""
             }
             
+            # Try different search filters
             $searchFilters = @(
                 "(samAccountName=$Name)",
-                "(samAccountName=${Name}$)",
                 "(objectSid=$Name)",
                 "(userPrincipalName=$Name)",
                 "(dnsHostName=$Name)",
@@ -4615,13 +4568,14 @@ function Resolve-PrincipalInDomain {
             Write-Verbose "ADSISearcher lookup failed for '$Name' in domain '$Domain': $_"
         }
         
+        # Try DirectorySearcher as final .NET attempt
         try {
             Write-Verbose "Attempting DirectorySearcher for '$Name' in domain '$Domain'"
             
             Add-Type -AssemblyName System.DirectoryServices -ErrorAction Stop
             
             $searcher = New-Object System.DirectoryServices.DirectorySearcher
-            $searcher.Filter = "(|(samAccountName=$Name)(samAccountName=${Name}$)(objectSid=$Name)(userPrincipalName=$Name)(dnsHostName=$Name))"
+            $searcher.Filter = "(|(samAccountName=$Name)(objectSid=$Name)(userPrincipalName=$Name)(dnsHostName=$Name))"
             $null = $searcher.PropertiesToLoad.Add("samAccountName")
             $null = $searcher.PropertiesToLoad.Add("objectSid")
             $null = $searcher.PropertiesToLoad.Add("distinguishedName")
@@ -4706,6 +4660,7 @@ function Resolve-PrincipalInDomain {
         }
     }
     
+    # Return failure
     return $null
 }
 
@@ -4715,6 +4670,7 @@ function Resolve-DomainPrincipal {
         [string[]]$AlternativeDomains = @()
     )
     
+    # Parse principal name to extract base name
     $name = $PrincipalName
     if ($PrincipalName -match "\\") {
         $name = $PrincipalName.Split('\')[1]
@@ -4724,6 +4680,7 @@ function Resolve-DomainPrincipal {
         $name = $PrincipalName.Split('.')[0]
     }
     
+    # Skip NT AUTHORITY principals
     if ($PrincipalName -match "^NT AUTHORITY\\") {
         Write-Verbose "Skipping non-domain principal $PrincipalName"
         return $null
@@ -4970,15 +4927,7 @@ function Get-MSSQLServersFromSPNs {
         # Search for all objects with MSSQLSvc SPNs
         $searcher = [adsisearcher]"(servicePrincipalName=MSSQLSvc/*)"
         if ($DomainName) {
-            # Build proper LDAP path for domain
-            if ($DomainName -match '\.') {
-                # FQDN format - convert to DC format
-                $domainDN = "DC=" + ($DomainName -replace "\.", ",DC=")
-                $searcher.SearchRoot = [adsi]"LDAP://$domainDN"
-            } else {
-                # NetBIOS format
-                $searcher.SearchRoot = [adsi]"LDAP://$DomainName"
-            }
+            $searcher.SearchRoot = [adsi]"LDAP://$DomainName"
         }
         $searcher.PageSize = 1000
         $searcher.PropertiesToLoad.AddRange(@('servicePrincipalName', 'distinguishedName', 'objectSid', 'samAccountName'))
@@ -9506,4 +9455,4 @@ finally {
     } else {
         Write-Warning "No output files were created"
     }
-} 
+}
