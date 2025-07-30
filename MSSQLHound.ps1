@@ -1,4 +1,4 @@
-<#
+ <#
 .SYNOPSIS
 MSSQLHound: PowerShell collector for adding MSSQL attack paths to BloodHound with OpenGraph
 
@@ -438,13 +438,68 @@ elseif ($OutputFormat -eq 'BloodHound-customnode') {
 }
 
 if (-not $script:Domain) {
+    # When using runas /netonly, we need to detect the domain differently
+    # Try multiple approaches to find the domain
+    
+    # First check if we're in a domain context by testing LDAP connectivity
+    $possibleDomains = @()
+    
+    # Check environment variables that might be set
+    if ($env:USERDNSDOMAIN) { $possibleDomains += $env:USERDNSDOMAIN }
+    if ($env:LOGONSERVER -and $env:LOGONSERVER -ne '\\' + $env:COMPUTERNAME) {
+        # Extract domain from logon server
+        try {
+            $serverName = $env:LOGONSERVER -replace '\\\\', ''
+            $dns = [System.Net.Dns]::GetHostEntry($serverName)
+            if ($dns.HostName -match '\.(.+)$') {
+                $possibleDomains += $matches[1]
+            }
+        } catch {}
+    }
+    
+    # Try to detect from any accessible domain controller
     try {
-        Write-Warning "No domain provided and could not find `$env:USERDNSDOMAIN, trying computer's domain"
-        $script:Domain = (Get-CimInstance Win32_ComputerSystem).Domain
-        Write-Host "Using computer's domain: $script:Domain"
+        $rootDSE = [ADSI]"LDAP://RootDSE"
+        if ($rootDSE.defaultNamingContext) {
+            $domainDN = $rootDSE.defaultNamingContext
+            $script:Domain = $domainDN -replace '^DC=' -replace ',DC=', '.'
+            Write-Host "Detected domain from LDAP RootDSE: $script:Domain"
+        }
     } catch {
-        Write-Warning "Error getting computer's domain, using `$env:USERDOMAIN: $_"
-        $script:Domain = $env:USERDOMAIN
+        Write-Verbose "Could not connect to LDAP RootDSE: $_"
+        
+        # Try common domain suffixes if we can detect any LDAP server
+        foreach ($testDomain in $possibleDomains) {
+            try {
+                $testPath = "LDAP://" + ("DC=" + ($testDomain -replace "\.", ",DC="))
+                $testBind = [ADSI]$testPath
+                if ($testBind.Path) {
+                    $script:Domain = $testDomain
+                    Write-Host "Found accessible domain: $script:Domain"
+                    break
+                }
+            } catch {
+                Write-Verbose "Domain $testDomain not accessible: $_"
+            }
+        }
+    }
+    
+    # Last resort - check computer domain
+    if (-not $script:Domain) {
+        try {
+            $computerDomain = (Get-CimInstance Win32_ComputerSystem).Domain
+            if ($computerDomain -and $computerDomain -ne 'WORKGROUP') {
+                Write-Warning "No accessible domain found via LDAP. Computer reports domain: $computerDomain"
+                Write-Warning "This may not work correctly. Consider using -Domain parameter."
+                $script:Domain = $computerDomain
+            }
+        } catch {}
+    }
+    
+    if (-not $script:Domain) {
+        Write-Error "Unable to detect domain. When using runas /netonly from a non-domain machine, please specify -Domain parameter."
+        Write-Host "Example: .\sql.ps1 -Domain training.local" -ForegroundColor Yellow
+        return
     }
 }
 
@@ -4915,7 +4970,15 @@ function Get-MSSQLServersFromSPNs {
         # Search for all objects with MSSQLSvc SPNs
         $searcher = [adsisearcher]"(servicePrincipalName=MSSQLSvc/*)"
         if ($DomainName) {
-            $searcher.SearchRoot = [adsi]"LDAP://$DomainName"
+            # Build proper LDAP path for domain
+            if ($DomainName -match '\.') {
+                # FQDN format - convert to DC format
+                $domainDN = "DC=" + ($DomainName -replace "\.", ",DC=")
+                $searcher.SearchRoot = [adsi]"LDAP://$domainDN"
+            } else {
+                # NetBIOS format
+                $searcher.SearchRoot = [adsi]"LDAP://$DomainName"
+            }
         }
         $searcher.PageSize = 1000
         $searcher.PropertiesToLoad.AddRange(@('servicePrincipalName', 'distinguishedName', 'objectSid', 'samAccountName'))
@@ -9443,4 +9506,4 @@ finally {
     } else {
         Write-Warning "No output files were created"
     }
-}
+} 
