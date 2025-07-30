@@ -4314,24 +4314,27 @@ function Resolve-PrincipalInDomain {
     
     Write-Verbose "Attempting to resolve '$Name' in domain '$Domain'"
     
-    # Try Active Directory PowerShell module first
+    $adPowershellSucceeded = $false
+    
     if (Get-Command -Name Get-ADComputer -ErrorAction SilentlyContinue) {
         Write-Verbose "Trying AD PowerShell module in domain: $Domain"
         
         try {
             $adObject = $null
             
-            # Set server parameter if domain is specified and different from current
             $adParams = @{ Identity = $Name }
             if ($Domain -and $Domain -ne $env:USERDOMAIN -and $Domain -ne $env:USERDNSDOMAIN) {
                 $adParams.Server = $Domain
             }
             
-            # Try Computer first
             try {
                 $adObject = Get-ADComputer @adParams -ErrorAction Stop
             } catch {
-                # Try Computer by SID
+                try {
+                    $adParams.Identity = "${Name}$"
+                    $adObject = Get-ADComputer @adParams -ErrorAction Stop
+                } catch {
+                }
                 try {
                     $adParams.Remove('Identity')
                     $adParams.LDAPFilter = "(objectSid=$Name)"
@@ -4384,6 +4387,7 @@ function Resolve-PrincipalInDomain {
                     $adObject.ObjectClass 
                 }
                 
+                $adPowershellSucceeded = $true
                 return [PSCustomObject]@{
                     ObjectIdentifier = $adObjectSid
                     Name = $adObjectName
@@ -4404,20 +4408,16 @@ function Resolve-PrincipalInDomain {
         }
     }
     
-    # Try .NET DirectoryServices AccountManagement
-    if ($script:UseNetFallback -or -not (Get-Command -Name Get-ADComputer -ErrorAction SilentlyContinue)) {
+    if ($script:UseNetFallback -or -not (Get-Command -Name Get-ADComputer -ErrorAction SilentlyContinue) -or -not $adPowershellSucceeded) {
         Write-Verbose "Attempting .NET DirectoryServices AccountManagement for '$Name' in domain '$Domain'"
         
         try {
-            # Load assemblies - these must succeed for .NET approach to work
             Add-Type -AssemblyName System.DirectoryServices.AccountManagement -ErrorAction Stop
             Add-Type -AssemblyName System.DirectoryServices -ErrorAction Stop
             
-            # Try AccountManagement approach
             $context = New-Object System.DirectoryServices.AccountManagement.PrincipalContext([System.DirectoryServices.AccountManagement.ContextType]::Domain, $Domain)
             $principal = $null
             
-            # Try as Computer
             try {
                 $principal = [System.DirectoryServices.AccountManagement.ComputerPrincipal]::FindByIdentity($context, $Name)
                 if ($principal) {
@@ -4427,7 +4427,6 @@ function Resolve-PrincipalInDomain {
                 Write-Verbose "Computer lookup failed: $_"
             }
             
-            # Try as User if computer lookup failed
             if (-not $principal) {
                 try {
                     $principal = [System.DirectoryServices.AccountManagement.UserPrincipal]::FindByIdentity($context, $Name)
@@ -4439,7 +4438,6 @@ function Resolve-PrincipalInDomain {
                 }
             }
             
-            # Try as Group if user lookup failed
             if (-not $principal) {
                 try {
                     $principal = [System.DirectoryServices.AccountManagement.GroupPrincipal]::FindByIdentity($context, $Name)
@@ -4479,11 +4477,9 @@ function Resolve-PrincipalInDomain {
             Write-Verbose "Failed .NET DirectoryServices AccountManagement for '$Name' in domain '$Domain': $_"
         }
         
-        # Try ADSISearcher approach
         try {
             Write-Verbose "Attempting ADSISearcher for '$Name' in domain '$Domain'"
             
-            # Build LDAP path
             $domainDN = if ($Domain) {
                 "DC=" + ($Domain -replace "\.", ",DC=")
             } else {
@@ -4497,9 +4493,9 @@ function Resolve-PrincipalInDomain {
                 [ADSISearcher]""
             }
             
-            # Try different search filters
             $searchFilters = @(
                 "(samAccountName=$Name)",
+                "(samAccountName=${Name}$)",
                 "(objectSid=$Name)",
                 "(userPrincipalName=$Name)",
                 "(dnsHostName=$Name)",
@@ -4564,14 +4560,13 @@ function Resolve-PrincipalInDomain {
             Write-Verbose "ADSISearcher lookup failed for '$Name' in domain '$Domain': $_"
         }
         
-        # Try DirectorySearcher as final .NET attempt
         try {
             Write-Verbose "Attempting DirectorySearcher for '$Name' in domain '$Domain'"
             
             Add-Type -AssemblyName System.DirectoryServices -ErrorAction Stop
             
             $searcher = New-Object System.DirectoryServices.DirectorySearcher
-            $searcher.Filter = "(|(samAccountName=$Name)(objectSid=$Name)(userPrincipalName=$Name)(dnsHostName=$Name))"
+            $searcher.Filter = "(|(samAccountName=$Name)(samAccountName=${Name}$)(objectSid=$Name)(userPrincipalName=$Name)(dnsHostName=$Name))"
             $null = $searcher.PropertiesToLoad.Add("samAccountName")
             $null = $searcher.PropertiesToLoad.Add("objectSid")
             $null = $searcher.PropertiesToLoad.Add("distinguishedName")
@@ -4656,7 +4651,6 @@ function Resolve-PrincipalInDomain {
         }
     }
     
-    # Return failure
     return $null
 }
 
@@ -4666,7 +4660,6 @@ function Resolve-DomainPrincipal {
         [string[]]$AlternativeDomains = @()
     )
     
-    # Parse principal name to extract base name
     $name = $PrincipalName
     if ($PrincipalName -match "\\") {
         $name = $PrincipalName.Split('\')[1]
@@ -4676,7 +4669,6 @@ function Resolve-DomainPrincipal {
         $name = $PrincipalName.Split('.')[0]
     }
     
-    # Skip NT AUTHORITY principals
     if ($PrincipalName -match "^NT AUTHORITY\\") {
         Write-Verbose "Skipping non-domain principal $PrincipalName"
         return $null
